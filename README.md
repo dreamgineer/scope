@@ -3,7 +3,7 @@
 Scope is a waybar widget that implements other widgets in TypeScript, merging them into 1 single at-a-glance widget.
 
 > [!WARNING]
-> This is a bad implementation of widgets. It is meant to be used by me only. Please do not roast me for not being able to figure out how to paste an ancient old CPU code from StackOverflow. Thank you.
+> This is a bad implementation of widgets. It is meant to be used by me only. Please do not roast me for being bad at it or using TypeScript in the first place. Thank you.
 
 ## Usage
 
