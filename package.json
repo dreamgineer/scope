@@ -1,0 +1,19 @@
+{
+  "name": "info",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@dbus-types/networkmanager": "^0.0.5",
+    "dbus-ts": "^0.0.7"
+  },
+  "scripts": {
+    "postinstall": "bun2nix -o bun.nix"
+  }
+}
