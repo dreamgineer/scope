@@ -3,7 +3,13 @@ import { cpus, totalmem } from "os";
 import { systemBus } from "dbus-ts";
 import type { Interfaces as NetworkManager } from "@dbus-types/networkmanager";
 import { spawn } from "child_process";
-(async () => {
+import { secondary } from "./second";
+import {
+  ActivityType,
+  type NixJSONMessage,
+  type NixMsgMessage,
+} from "./rebuild";
+async function main() {
   const bus = await systemBus<NetworkManager>();
   var ready = false;
 
@@ -20,6 +26,25 @@ import { spawn } from "child_process";
     })
   );
 
+  const socket = Bun.serve({
+    fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname === "/ws") this.upgrade(req);
+      else if (url.pathname === "/rebuild") {
+        rebuild();
+        return new Response("Todo");
+      }
+    },
+    websocket: {
+      open(ws) {
+        ws.subscribe("secondary");
+      },
+      message() {},
+    },
+    port: 51234, // hopefully no duplicate
+    reusePort: true,
+  });
+
   const data = {
     bat: -1, // Battery
     vol: -1, // Volume
@@ -30,6 +55,8 @@ import { spawn } from "child_process";
     net: "", // Network
     mut: false, // Muted
     low: false, // Low battery
+    nxs: [0, 0, 0, 0], // Build(Done, Expected), Download(Done, Expected)
+    nxr: false, // Rebuilding
   };
 
   const nmbus = await bus.getInterface(
@@ -219,25 +246,13 @@ import { spawn } from "child_process";
   }
 
   var last: string = "";
-  function show(data: Data) {
-    try {
-      const out = JSON.stringify(data);
-      if (out == last) return;
-      last = out;
-      if (DEBUG) console.log("Now ", out);
-      else console.log(out);
-    } catch {}
-  }
-  type Data = {
-    text: string;
-    alt?: string;
-    tooltip: string;
-    class: string;
-    percentage?: number;
-  };
-  enum ShowType {
-    NET,
-    VOL,
+  function show(data: Data, secondary?: Data) {
+    const out = JSON.stringify(data);
+    if (out == last) return;
+    last = out;
+    if (DEBUG) console.log("Now ", out);
+    else console.log(out);
+    if (secondary) socket.publish("secondary", out);
   }
 
   async function init() {
@@ -291,4 +306,107 @@ import { spawn } from "child_process";
     // @ts-ignore
     process.addListener("unhandledRejection", errorHandler);
   }
-})();
+
+  async function rebuild() {
+    const proc = Bun.spawn({
+      cmd: [
+        "nix",
+        "build",
+        `/etc/nixos#nixosConfigurations.${process.env.HOSTNAME}.config.system.build.toplevel`,
+        "--print-out-paths",
+        "--log-format",
+        "internal-json",
+      ],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const logs: string[] = [];
+    const jobs: Record<
+      number,
+      { progress?: [number, number]; type: "bd" | "dl" }
+    > = {};
+    // Build Done, Build Expected, Download Done, Download Expected
+    const tasks: [number, number, number, number] = [0, 0, 0, 0];
+    for await (const line of proc.stdout.values()) {
+      const text = line.toString();
+      if (text.startsWith("/")) {
+        // Handle activation
+        const activate = `${text}/bin/switch-to-configuration switch`;
+        // TODO
+        break;
+      }
+      const data = <NixJSONMessage>JSON.parse(text.substring(5));
+      switch (data.action) {
+        case "result":
+          switch (data.type) {
+            case 105:
+              if (!jobs[data.id]) break;
+              const { progress, type } = jobs[data.id]!;
+              const offset = type === "dl" ? 2 : 0;
+              if (progress) {
+                tasks[offset] -= progress[0];
+                tasks[offset + 1]! -= progress[1];
+              }
+              jobs[data.id]!.progress = [data.fields[0], data.fields[1]];
+              tasks[offset] += data.fields[0];
+              tasks[offset + 1]! += data.fields[1];
+              break;
+            default:
+          }
+          break;
+        case "start":
+          switch (data.type) {
+            case ActivityType.BuildType:
+              jobs[data.id] = { type: "bd" };
+              break;
+            case ActivityType.CopyPathsType:
+              jobs[data.id] = { type: "dl" };
+              break;
+            default:
+          }
+          break;
+        case "msg":
+          logs.push(data.msg);
+          break;
+        default:
+      }
+    }
+    for await (const line of proc.stderr.values()) {
+      try {
+        const data = <NixMsgMessage>JSON.parse(line.toString().substring(5));
+        logs.push(data.msg);
+      } catch {
+        logs.push(line.toString());
+      }
+    }
+    Bun.$`mktemp -t --suffix .log`
+      .text()
+      .then((e) => (Bun.write(e, logs.join("\n")), e))
+      .then((e) => Bun.$`kitty micro ${e}`);
+  }
+}
+
+export type Data = {
+  text: string;
+  alt?: string;
+  tooltip: string;
+  class: string;
+  percentage?: number;
+};
+export enum ShowType {
+  NET,
+  VOL,
+}
+
+switch (process.argv.pop()) {
+  case "secondary":
+    secondary();
+    break;
+  case "rebuild":
+    fetch("http://localhost:51234/rebuild")
+      .then((e) => e.text())
+      .then(console.log);
+    break;
+  default:
+    main();
+}

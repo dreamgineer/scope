@@ -7,5 +7,5 @@ mkBunDerivation {
 
   bunNix = ./bun.nix;
 
-  index = "index.ts";
+  index = "src/index.ts";
 }

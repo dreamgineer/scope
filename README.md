@@ -31,6 +31,10 @@ This is my setup, also including the hidden widgets in a group.
 }
 ```
 
+### Secondary widget
+
+This is a Work-In-Progress widget to extend the original widget intended to be used in another expanding group to act as a cool tooltip-like thing.
+
 ## Development
 
 A flag `--debug` is provided for convenience of debugging. This will remove unnecessary prints and switch to Past/Now logging.
