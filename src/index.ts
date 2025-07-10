@@ -32,7 +32,7 @@ async function main() {
       if (url.pathname === "/ws") this.upgrade(req);
       else if (url.pathname === "/rebuild") {
         rebuild();
-        return new Response("Todo");
+        return new Response("Rebuilding NixOS from Scope...");
       }
     },
     websocket: {
@@ -160,7 +160,7 @@ async function main() {
   async function update(timeout?: ShowType) {
     if (DEBUG) console.log("\u001bcData", JSON.stringify(data), "\nLast", last);
     if (!ready) return tick();
-    const { bat, vol, cpu, ram, ntf, rec, net, mut, low } = data;
+    const { bat, vol, cpu, ram, ntf, rec, net, mut, low, nxr, nxs } = data;
 
     const volText = mut ? `` : `${vol}% ${vol < 20 ? "" : " "}`;
 
@@ -184,7 +184,24 @@ async function main() {
           return;
       }
     } else if (overlay) return;
-    else if (cpu > 80)
+    else if (nxr) {
+      if (nxs[1] !== 0)
+        show({
+          text: `<span foreground="#ffb740">${
+            nxs[0]
+          }</span>/<span foreground="#a0ff40">${
+            nxs[1]
+          }</span> <span foreground="#40ceff">${nxs[3]! - nxs[2]!}</span>`,
+          class: "nxs",
+          tooltip: `Rebuilding NixOS\nBuilding: ${nxs[0]}/${nxs[1]}\nDownload: ${nxs[2]}/${nxs[3]}`,
+        });
+      else
+        show({
+          text: "",
+          class: "nxr",
+          tooltip: "Rebuilding NixOS...",
+        });
+    } else if (cpu > 80)
       show({
         text: `${cpu}% `,
         class: "cpu",
@@ -308,11 +325,15 @@ async function main() {
   }
 
   async function rebuild() {
+    data.nxr = true;
+    update();
     const proc = Bun.spawn({
       cmd: [
         "nix",
         "build",
-        `/etc/nixos#nixosConfigurations.${process.env.HOSTNAME}.config.system.build.toplevel`,
+        `/etc/nixos#nixosConfigurations.${(
+          await $`hostname`.text()
+        ).trim()}.config.system.build.toplevel`,
         "--print-out-paths",
         "--log-format",
         "internal-json",
@@ -327,62 +348,74 @@ async function main() {
     > = {};
     // Build Done, Build Expected, Download Done, Download Expected
     const tasks: [number, number, number, number] = [0, 0, 0, 0];
+    const decoder = new TextDecoder();
+
+    for await (const line of proc.stderr.values()) {
+      const texts = decoder.decode(line);
+      for (const text of texts.split("\n")) {
+        if (!text) continue;
+        const d = <NixJSONMessage>JSON.parse(text.substring(5));
+        switch (d.action) {
+          case "result":
+            switch (d.type) {
+              case 105:
+                if (!jobs[d.id]) break;
+                const { progress, type } = jobs[d.id]!;
+                const offset = type === "dl" ? 2 : 0;
+                if (progress) {
+                  tasks[offset] -= progress[0];
+                  tasks[offset + 1]! -= progress[1];
+                }
+                jobs[d.id]!.progress = [d.fields[0], d.fields[1]];
+                tasks[offset] += d.fields[0];
+                tasks[offset + 1]! += d.fields[1];
+                data.nxs = tasks;
+                update();
+                break;
+              default:
+            }
+            break;
+          case "start":
+            switch (d.type) {
+              case ActivityType.BuildType:
+                jobs[d.id] = { type: "bd" };
+                break;
+              case ActivityType.CopyPathsType:
+                jobs[d.id] = { type: "dl" };
+                break;
+              default:
+            }
+            break;
+          case "msg":
+            logs.push(d.msg.trim() + "\n");
+            break;
+          default:
+        }
+      }
+    }
     for await (const line of proc.stdout.values()) {
-      const text = line.toString();
+      const text = decoder.decode(line);
       if (text.startsWith("/")) {
         // Handle activation
-        const activate = `${text}/bin/switch-to-configuration switch`;
-        // TODO
+        logs.push("\n --- ACTIVATING GENERATION ---\n\n");
+        const activation = Bun.spawn({
+          cmd: ["sudo", `${text.trim()}/bin/switch-to-configuration`, "switch"],
+          stdout: "ignore",
+          stderr: "pipe",
+        });
+        for await (const line of activation.stderr.values())
+          logs.push(decoder.decode(line));
+        await activation.exited;
         break;
-      }
-      const data = <NixJSONMessage>JSON.parse(text.substring(5));
-      switch (data.action) {
-        case "result":
-          switch (data.type) {
-            case 105:
-              if (!jobs[data.id]) break;
-              const { progress, type } = jobs[data.id]!;
-              const offset = type === "dl" ? 2 : 0;
-              if (progress) {
-                tasks[offset] -= progress[0];
-                tasks[offset + 1]! -= progress[1];
-              }
-              jobs[data.id]!.progress = [data.fields[0], data.fields[1]];
-              tasks[offset] += data.fields[0];
-              tasks[offset + 1]! += data.fields[1];
-              break;
-            default:
-          }
-          break;
-        case "start":
-          switch (data.type) {
-            case ActivityType.BuildType:
-              jobs[data.id] = { type: "bd" };
-              break;
-            case ActivityType.CopyPathsType:
-              jobs[data.id] = { type: "dl" };
-              break;
-            default:
-          }
-          break;
-        case "msg":
-          logs.push(data.msg);
-          break;
-        default:
-      }
+      } else logs.push(text);
     }
-    for await (const line of proc.stderr.values()) {
-      try {
-        const data = <NixMsgMessage>JSON.parse(line.toString().substring(5));
-        logs.push(data.msg);
-      } catch {
-        logs.push(line.toString());
-      }
-    }
-    Bun.$`mktemp -t --suffix .log`
-      .text()
-      .then((e) => (Bun.write(e, logs.join("\n")), e))
-      .then((e) => Bun.$`kitty micro ${e}`);
+    await Bun.write("/tmp/scopeswitch.log", logs.join(""));
+    await $`hyprctl dispatch exec "[size 90% 90%; pin; float; stayfocused; dimaround; animation; animation popin]kitty bash -c \"cat /tmp/scopeswitch.log; read -n1 -s\""`
+      .quiet()
+      .nothrow();
+    data.nxr = false;
+    data.nxs = [0, 0, 0, 0];
+    update();
   }
 }
 
