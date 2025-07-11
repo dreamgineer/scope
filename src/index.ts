@@ -4,11 +4,7 @@ import { systemBus } from "dbus-ts";
 import type { Interfaces as NetworkManager } from "@dbus-types/networkmanager";
 import { spawn } from "child_process";
 import { secondary } from "./second";
-import {
-  ActivityType,
-  type NixJSONMessage,
-  type NixMsgMessage,
-} from "./rebuild";
+import { ActivityType, type NixJSONMessage } from "./rebuild";
 async function main() {
   const bus = await systemBus<NetworkManager>();
   var ready = false;
@@ -31,6 +27,10 @@ async function main() {
       const url = new URL(req.url);
       if (url.pathname === "/ws") this.upgrade(req);
       else if (url.pathname === "/rebuild") {
+        if (data.nxr)
+          return new Response(
+            "Rebuilding process already running, not rebuilding."
+          );
         rebuild();
         return new Response("Rebuilding NixOS from Scope...");
       }
@@ -55,7 +55,7 @@ async function main() {
     net: "", // Network
     mut: false, // Muted
     low: false, // Low battery
-    nxs: [0, 0, 0, 0], // Build(Done, Expected), Download(Done, Expected)
+    nxs: [0, 0, 0, 0, 0], // Build(Done, Expected), Download(Done, Expected)
     nxr: false, // Rebuilding
   };
 
@@ -185,7 +185,7 @@ async function main() {
       }
     } else if (overlay) return;
     else if (nxr) {
-      if (nxs[1] !== 0)
+      if (nxs[4] === 1)
         show({
           text: `<span foreground="#ffb740">${
             nxs[0]
@@ -347,7 +347,7 @@ async function main() {
       { progress?: [number, number]; type: "bd" | "dl" }
     > = {};
     // Build Done, Build Expected, Download Done, Download Expected
-    const tasks: [number, number, number, number] = [0, 0, 0, 0];
+    const tasks: [number, number, number, number, 1] = [0, 0, 0, 0, 1];
     const decoder = new TextDecoder();
 
     for await (const line of proc.stderr.values()) {
@@ -414,7 +414,7 @@ async function main() {
       .quiet()
       .nothrow();
     data.nxr = false;
-    data.nxs = [0, 0, 0, 0];
+    data.nxs = [0, 0, 0, 0, 0];
     update();
   }
 }
