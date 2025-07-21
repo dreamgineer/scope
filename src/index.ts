@@ -187,11 +187,11 @@ async function main() {
     else if (nxr) {
       if (nxs[4] === 1)
         show({
-          text: `<span foreground="#ffb740">${
-            nxs[0]
-          }</span>/<span foreground="#a0ff40">${
-            nxs[1]
-          }</span> <span foreground="#40ceff">${nxs[3]! - nxs[2]!}</span>`,
+          text: `${
+            nxs[1]! > 0
+              ? ` <span foreground="#ffb740">${nxs[0]}</span>/<span foreground="#a0ff40">${nxs[1]}</span> `
+              : ""
+          }<span foreground="#40ceff">↓ ${nxs[3]! - nxs[2]!}</span>`,
           class: "nxs",
           tooltip: `Rebuilding NixOS\nBuilding: ${nxs[0]}/${nxs[1]}\nDownload: ${nxs[2]}/${nxs[3]}`,
         });
@@ -344,7 +344,10 @@ async function main() {
     const logs: string[] = [];
     const jobs: Record<
       number,
-      { progress?: [number, number]; type: "bd" | "dl" }
+      {
+        progress?: [number, number];
+        type: "bd" | "dl";
+      }
     > = {};
     // Build Done, Build Expected, Download Done, Download Expected
     const tasks: [number, number, number, number, 1] = [0, 0, 0, 0, 1];
@@ -378,6 +381,7 @@ async function main() {
           case "start":
             switch (d.type) {
               case ActivityType.BuildType:
+              case ActivityType.BuildsType:
                 jobs[d.id] = { type: "bd" };
                 break;
               case ActivityType.CopyPathsType:
