@@ -407,6 +407,7 @@ async function main() {
           stdout: "ignore",
           stderr: "pipe",
         });
+        activation.unref();
         for await (const line of activation.stderr.values())
           logs.push(decoder.decode(line));
         await activation.exited;
