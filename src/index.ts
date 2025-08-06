@@ -3,7 +3,9 @@ import { cpus, totalmem } from "os";
 import { systemBus } from "dbus-ts";
 import type { Interfaces as NetworkManager } from "@dbus-types/networkmanager";
 import { spawn } from "child_process";
-(async () => {
+import { secondary } from "./second";
+import { ActivityType, type NixJSONMessage } from "./rebuild";
+async function main() {
   const bus = await systemBus<NetworkManager>();
   var ready = false;
 
@@ -20,6 +22,29 @@ import { spawn } from "child_process";
     })
   );
 
+  const socket = Bun.serve({
+    fetch(req) {
+      const url = new URL(req.url);
+      if (url.pathname === "/ws") this.upgrade(req);
+      else if (url.pathname === "/rebuild") {
+        if (data.nxr)
+          return new Response(
+            "Rebuilding process already running, not rebuilding."
+          );
+        rebuild();
+        return new Response("Rebuilding NixOS from Scope...");
+      }
+    },
+    websocket: {
+      open(ws) {
+        ws.subscribe("secondary");
+      },
+      message() {},
+    },
+    port: 51234, // hopefully no duplicate
+    reusePort: true,
+  });
+
   const data = {
     bat: -1, // Battery
     vol: -1, // Volume
@@ -30,6 +55,8 @@ import { spawn } from "child_process";
     net: "", // Network
     mut: false, // Muted
     low: false, // Low battery
+    nxs: [0, 0, 0, 0, 0], // Build(Done, Expected), Download(Done, Expected)
+    nxr: false, // Rebuilding
   };
 
   const nmbus = await bus.getInterface(
@@ -133,7 +160,7 @@ import { spawn } from "child_process";
   async function update(timeout?: ShowType) {
     if (DEBUG) console.log("\u001bcData", JSON.stringify(data), "\nLast", last);
     if (!ready) return tick();
-    const { bat, vol, cpu, ram, ntf, rec, net, mut, low } = data;
+    const { bat, vol, cpu, ram, ntf, rec, net, mut, low, nxr, nxs } = data;
 
     const volText = mut ? `` : `${vol}% ${vol < 20 ? "" : " "}`;
 
@@ -157,7 +184,24 @@ import { spawn } from "child_process";
           return;
       }
     } else if (overlay) return;
-    else if (cpu > 80)
+    else if (nxr) {
+      if (nxs[4] === 1)
+        show({
+          text: `${
+            nxs[1]! > 0
+              ? ` <span foreground="#ffb740">${nxs[0]}</span>/<span foreground="#a0ff40">${nxs[1]}</span> `
+              : ""
+          }<span foreground="#40ceff">↓ ${nxs[3]! - nxs[2]!}</span>`,
+          class: "nxs",
+          tooltip: `Rebuilding NixOS\nBuilding: ${nxs[0]}/${nxs[1]}\nDownload: ${nxs[2]}/${nxs[3]}`,
+        });
+      else
+        show({
+          text: "",
+          class: "nxr",
+          tooltip: "Rebuilding NixOS...",
+        });
+    } else if (cpu > 80)
       show({
         text: `${cpu}% `,
         class: "cpu",
@@ -219,25 +263,13 @@ import { spawn } from "child_process";
   }
 
   var last: string = "";
-  function show(data: Data) {
-    try {
-      const out = JSON.stringify(data);
-      if (out == last) return;
-      last = out;
-      if (DEBUG) console.log("Now ", out);
-      else console.log(out);
-    } catch {}
-  }
-  type Data = {
-    text: string;
-    alt?: string;
-    tooltip: string;
-    class: string;
-    percentage?: number;
-  };
-  enum ShowType {
-    NET,
-    VOL,
+  function show(data: Data, secondary?: Data) {
+    const out = JSON.stringify(data);
+    if (out == last) return;
+    last = out;
+    if (DEBUG) console.log("Now ", out);
+    else console.log(out);
+    if (secondary) socket.publish("secondary", out);
   }
 
   async function init() {
@@ -291,4 +323,128 @@ import { spawn } from "child_process";
     // @ts-ignore
     process.addListener("unhandledRejection", errorHandler);
   }
-})();
+
+  async function rebuild() {
+    data.nxr = true;
+    update();
+    const proc = Bun.spawn({
+      cmd: [
+        "nix",
+        "build",
+        `/etc/nixos#nixosConfigurations.${(
+          await $`hostname`.text()
+        ).trim()}.config.system.build.toplevel`,
+        "--print-out-paths",
+        "--log-format",
+        "internal-json",
+      ],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const logs: string[] = [];
+    const jobs: Record<
+      number,
+      {
+        progress?: [number, number];
+        type: "bd" | "dl";
+      }
+    > = {};
+    // Build Done, Build Expected, Download Done, Download Expected
+    const tasks: [number, number, number, number, 1] = [0, 0, 0, 0, 1];
+    const decoder = new TextDecoder();
+
+    for await (const line of proc.stderr.values()) {
+      const texts = decoder.decode(line);
+      for (const text of texts.split("\n")) {
+        if (!text) continue;
+        const d = <NixJSONMessage>JSON.parse(text.substring(5));
+        switch (d.action) {
+          case "result":
+            switch (d.type) {
+              case 105:
+                if (!jobs[d.id]) break;
+                const { progress, type } = jobs[d.id]!;
+                const offset = type === "dl" ? 2 : 0;
+                if (progress) {
+                  tasks[offset] -= progress[0];
+                  tasks[offset + 1]! -= progress[1];
+                }
+                jobs[d.id]!.progress = [d.fields[0], d.fields[1]];
+                tasks[offset] += d.fields[0];
+                tasks[offset + 1]! += d.fields[1];
+                data.nxs = tasks;
+                update();
+                break;
+              default:
+            }
+            break;
+          case "start":
+            switch (d.type) {
+              case ActivityType.BuildType:
+              case ActivityType.BuildsType:
+                jobs[d.id] = { type: "bd" };
+                break;
+              case ActivityType.CopyPathsType:
+                jobs[d.id] = { type: "dl" };
+                break;
+              default:
+            }
+            break;
+          case "msg":
+            logs.push(d.msg.trim() + "\n");
+            break;
+          default:
+        }
+      }
+    }
+    for await (const line of proc.stdout.values()) {
+      const text = decoder.decode(line);
+      if (text.startsWith("/")) {
+        // Handle activation
+        logs.push("\n --- ACTIVATING GENERATION ---\n\n");
+        const activation = Bun.spawn({
+          cmd: ["sudo", `${text.trim()}/bin/switch-to-configuration`, "switch"],
+          stdout: "ignore",
+          stderr: "pipe",
+        });
+        activation.unref();
+        for await (const line of activation.stderr.values())
+          logs.push(decoder.decode(line));
+        await activation.exited;
+        break;
+      } else logs.push(text);
+    }
+    await Bun.write("/tmp/scopeswitch.log", logs.join(""));
+    await $`hyprctl dispatch exec "[size 90% 90%; pin; float; stayfocused; dimaround; animation; animation popin]kitty bash -c \"cat /tmp/scopeswitch.log; read -n1 -s\""`
+      .quiet()
+      .nothrow();
+    data.nxr = false;
+    data.nxs = [0, 0, 0, 0, 0];
+    update();
+  }
+}
+
+export type Data = {
+  text: string;
+  alt?: string;
+  tooltip: string;
+  class: string;
+  percentage?: number;
+};
+export enum ShowType {
+  NET,
+  VOL,
+}
+
+switch (process.argv.pop()) {
+  case "secondary":
+    secondary();
+    break;
+  case "rebuild":
+    fetch("http://localhost:51234/rebuild")
+      .then((e) => e.text())
+      .then(console.log);
+    break;
+  default:
+    main();
+}
